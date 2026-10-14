@@ -8,10 +8,15 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 
 DEFAULT_MODEL = "gemini-flash-latest"  # alias that always points to the newest Flash model
+FALLBACK_MODELS = ["gemini-flash-lite-latest"]  # tried if the main model stays overloaded
+RETRIES_PER_MODEL = 3
+BACKOFF_SECONDS = 2  # waits 2s, 4s between retries
+TRANSIENT_MARKERS = ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED", "INTERNAL", "503", "429", "504")
 MAX_RESUME_CHARS = 15000
 MAX_JD_CHARS = 6000
 
@@ -77,10 +82,13 @@ def local_checks(text: str) -> dict:
     for core in ("Experience", "Education", "Skills"):
         checks.append((f"'{core}' section detected", core in found_sections, 12))
 
-    length_ok = 250 <= word_count <= 1200
+    length_ok = 150 <= word_count <= 1200
     checks.append((f"Reasonable length ({word_count} words)", length_ok, 14))
 
+    # Bullets: normal bullet characters at line start, or a lone symbol on its own
+    # line (some PDF fonts extract bullets that way).
     bullet_count = len(re.findall(r"^\s*[-•*▪●◦]", text, flags=re.MULTILINE))
+    bullet_count += len(re.findall(r"^\s*[^\w\s]\s*$", text, flags=re.MULTILINE))
     checks.append(("Uses bullet points", bullet_count >= 5, 8))
 
     has_numbers = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:%|\+|k|m|x)?", text)) >= 5
@@ -187,6 +195,25 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def is_transient_error(exc: Exception) -> bool:
+    """True for temporary Gemini errors (overloaded, rate limited, timeouts)."""
+    if getattr(exc, "code", None) in (429, 500, 503, 504):
+        return True
+    message = str(exc).upper()
+    return any(marker in message for marker in TRANSIENT_MARKERS)
+
+
+def _generate_with_retry(client, model, prompt, config):
+    """Call Gemini, retrying temporary failures with exponential backoff."""
+    for attempt in range(RETRIES_PER_MODEL):
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=config)
+        except Exception as exc:
+            if not is_transient_error(exc) or attempt == RETRIES_PER_MODEL - 1:
+                raise
+            time.sleep(BACKOFF_SECONDS * (2 ** attempt))
+
+
 def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
     from google import genai
     from google.genai import types
@@ -198,13 +225,20 @@ def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_descript
     )
     prompt = build_prompt(resume_text, job_description)
 
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
-    for _ in range(2):  # one retry if the JSON comes back malformed
-        response = client.models.generate_content(model=model, contents=prompt, config=config)
+    for current_model in models_to_try:
         try:
-            return normalize_result(parse_json_response(response.text))
-        except ValueError as exc:
+            for _ in range(2):  # one retry if the JSON comes back malformed
+                response = _generate_with_retry(client, current_model, prompt, config)
+                try:
+                    return normalize_result(parse_json_response(response.text))
+                except ValueError as exc:
+                    last_error = exc
+        except Exception as exc:
             last_error = exc
+            if not is_transient_error(exc):
+                raise  # e.g. invalid API key or unknown model: fallback won't help
     raise last_error
 
 
@@ -279,7 +313,14 @@ def main():
             try:
                 ai = analyze_with_gemini(api_key, model, resume_text, job_description)
             except Exception as exc:
-                st.error(f"Analysis failed: {exc}")
+                if is_transient_error(exc):
+                    st.error(
+                        "Google's Gemini service is overloaded right now (the app already "
+                        "retried and tried a backup model). Please wait a minute and click "
+                        "Analyze again."
+                    )
+                else:
+                    st.error(f"Analysis failed: {exc}")
                 st.stop()
             local = local_checks(resume_text)
 
